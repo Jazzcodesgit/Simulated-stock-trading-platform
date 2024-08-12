@@ -1,0 +1,252 @@
+import os
+from datetime import datetime
+from cs50 import SQL
+from flask import Flask, flash, redirect, render_template, request, session
+from flask_session import Session
+from tempfile import mkdtemp
+from werkzeug.exceptions import default_exceptions, HTTPException, InternalServerError
+from werkzeug.security import check_password_hash, generate_password_hash
+
+from helpers import apology, login_required, lookup, usd
+
+# Create Flask application instance
+app = Flask(__name__)
+
+# Configuration for auto-reloading templates
+app.config["TEMPLATES_AUTO_RELOAD"] = True
+
+# Prevent response caching
+@app.after_request
+def after_request(response):
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Expires"] = 0
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+# Custom filter for formatting currency
+app.jinja_env.filters["usd"] = usd
+
+# Configure session management using filesystem
+app.config["SESSION_FILE_DIR"] = mkdtemp()
+app.config["SESSION_PERMANENT"] = False
+app.config["SESSION_TYPE"] = "filesystem"
+Session(app)
+
+# Set up SQLite database connection
+db = SQL("sqlite:///finance.db")
+
+# Load API key from environment variables
+API_KEY = os.environ.get('API_KEY')
+
+# Admin login status
+admin_logged = False
+
+@app.route("/admins/login", methods=["GET", "POST"])
+def admins_login():
+    """Admin login page for managing the application."""
+    if request.method == "POST":
+        username = request.form.get("username")
+        password = request.form.get("password")
+        
+        # Check admin credentials
+        user = db.execute("SELECT * FROM users WHERE username = ?", username)
+        if not user or not check_password_hash(user[0]["hash"], password) or user[0]["admin"] != 1:
+            return apology("Invalid username or password", 403)
+        
+        # Log in admin
+        global admin_logged
+        admin_logged = True
+        return redirect("/admins")
+    
+    return render_template("admin_login.html")
+
+@app.route("/admins", methods=["GET", "POST"])
+def admins():
+    """Admin dashboard for user management."""
+    if not admin_logged:
+        return redirect("/admins/login")
+    
+    if request.method == "POST":
+        username = request.form.get("users")
+        amount = int(request.form.get("amount"))
+        action = request.form.get("action")
+        
+        if action == "adjust_balance":
+            current_cash = db.execute("SELECT cash FROM users WHERE username = ?", username)[0]["cash"]
+            new_cash = current_cash + amount
+            db.execute("UPDATE users SET cash = ? WHERE username = ?", new_cash, username)
+    
+    users = db.execute("SELECT username FROM users")
+    return render_template("admins.html", users=users)
+
+@app.route("/information")
+@login_required
+def information():
+    """Information page about website features."""
+    return render_template("info.html")
+
+@app.route("/")
+@login_required
+def index():
+    """Display user's portfolio and total value."""
+    holdings = db.execute("SELECT symbol, SUM(shares) FROM transactions WHERE id = ? GROUP BY symbol", session["user_id"])
+    cash_balance = db.execute("SELECT cash FROM users WHERE id = ?", session["user_id"])[0]["cash"]
+    grand_total = cash_balance
+    
+    for stock in holdings:
+        symbol = stock["symbol"]
+        shares = stock["SUM(shares)"]
+        stock_info = lookup(symbol)
+        stock["name"] = stock_info["name"]
+        stock["price"] = usd(stock_info["price"])
+        stock["total"] = stock_info["price"] * shares
+        grand_total += stock["total"]
+    
+    db.execute("UPDATE users SET grand_total = ? WHERE id = ?", grand_total, session["user_id"])
+    return render_template("index.html", holdings=holdings, cash=usd(cash_balance), grand_total=usd(grand_total))
+
+@app.route("/buy", methods=["GET", "POST"])
+@login_required
+def buy():
+    """Buy shares of a stock."""
+    if request.method == "POST":
+        symbol = request.form.get("symbol")
+        shares = int(request.form.get("shares"))
+        
+        if not lookup(symbol):
+            return apology("Invalid stock symbol")
+        
+        price = lookup(symbol)["price"]
+        total_cost = price * shares
+        user_cash = db.execute("SELECT cash FROM users WHERE id = ?", session["user_id"])[0]["cash"]
+        
+        if total_cost > user_cash:
+            return apology("Insufficient funds")
+        
+        db.execute("UPDATE users SET cash = ? WHERE id = ?", user_cash - total_cost, session["user_id"])
+        db.execute(
+            "INSERT INTO transactions (id, name, symbol, shares, price, total, date) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            session["user_id"], lookup(symbol)["name"], symbol, shares, price, total_cost, datetime.now()
+        )
+        return redirect("/")
+    
+    return render_template("buy.html")
+
+@app.route("/history")
+@login_required
+def history():
+    """Show the user's transaction history."""
+    transactions = db.execute("SELECT symbol, shares, date FROM transactions WHERE id = ?", session["user_id"])
+    for txn in transactions:
+        txn["price"] = lookup(txn["symbol"])["price"]
+    return render_template("history.html", transactions=transactions)
+
+@app.route("/leaderboard")
+@login_required
+def leaderboard():
+    """Show the leaderboard of top users based on total value."""
+    top_users = db.execute("SELECT username, cash, grand_total FROM users ORDER BY grand_total DESC LIMIT 10")
+    return render_template("leaderboard.html", leaderboard=top_users)
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    """Log in a user."""
+    if request.method == "POST":
+        username = request.form.get("username")
+        password = request.form.get("password")
+        
+        user = db.execute("SELECT hash, id FROM users WHERE username = ?", username)
+        if not user or not check_password_hash(user[0]["hash"], password):
+            return apology("Invalid username or password", 403)
+        
+        session["user_id"] = user[0]["id"]
+        return redirect("/")
+    
+    return render_template("login.html")
+
+@app.route("/logout")
+def logout():
+    """Log out the user."""
+    global admin_logged
+    admin_logged = False
+    session.clear()
+    return redirect("/")
+
+@app.route("/quote", methods=["GET", "POST"])
+@login_required
+def quote():
+    """Get the current price of a stock."""
+    if request.method == "POST":
+        symbol = request.form.get("symbol")
+        stock_info = lookup(symbol)
+        if not stock_info:
+            return apology("Invalid stock symbol")
+        return render_template("quoted.html", name=stock_info["name"], symbol=stock_info["symbol"], price=stock_info["price"])
+    
+    return render_template("quote.html")
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    """Register a new user."""
+    if request.method == "POST":
+        username = request.form.get("username")
+        password = request.form.get("password")
+        confirmation = request.form.get("confirmation")
+        user_type = request.form.get("user_type")
+        admin_code = request.form.get("admin_code")
+        
+        if password != confirmation:
+            return apology("Passwords do not match", 403)
+        
+        hashed_password = generate_password_hash(password)
+        is_admin = 0
+        if user_type == "admin" and admin_code == os.environ.get('ADMIN_CODE'):
+            is_admin = 1
+        
+        try:
+            db.execute("INSERT INTO users (username, hash, admin) VALUES (?, ?, ?)", username, hashed_password, is_admin)
+        except:
+            return apology("Username already taken", 403)
+        
+        return redirect("/login")
+    
+    return render_template("register.html")
+
+@app.route("/sell", methods=["GET", "POST"])
+@login_required
+def sell():
+    """Sell shares of a stock."""
+    symbols = [row["symbol"] for row in db.execute("SELECT DISTINCT symbol FROM transactions WHERE id = ?", session["user_id"])]
+    
+    if request.method == "POST":
+        symbol = request.form.get("symbol")
+        shares = int(request.form.get("shares"))
+        price = lookup(symbol)["price"]
+        total_sale = price * shares
+        user_cash = db.execute("SELECT cash FROM users WHERE id = ?", session["user_id"])[0]["cash"]
+        available_shares = db.execute("SELECT SUM(shares) FROM transactions WHERE symbol = ? AND id = ?", symbol, session["user_id"])[0]["SUM(shares)"]
+        
+        if shares > available_shares:
+            return apology("Not enough shares to sell")
+        
+        db.execute(
+            "INSERT INTO transactions (id, name, symbol, shares, price, total, date) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            session["user_id"], lookup(symbol)["name"], symbol, -shares, price, -total_sale, datetime.now()
+        )
+        db.execute("UPDATE users SET cash = ? WHERE id = ?", user_cash + total_sale, session["user_id"])
+        return redirect("/")
+    
+    return render_template("sell.html", symbols=symbols)
+
+def errorhandler(e):
+    """Handle HTTP errors."""
+    if not isinstance(e, HTTPException):
+        e = InternalServerError()
+    return apology(e.name, e.code)
+
+# Register error handlers
+for code in default_exceptions:
+    app.errorhandler(code)(errorhandler)
+
+if __name__ == "__main__":
+    app.run()
